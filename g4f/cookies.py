@@ -82,6 +82,7 @@ COOKIE_DOMAINS = (
     "yupp.ai",
     "chat.deepseek.com",
     ".perplexity.ai"
+    "openrouter.ai",
 )
 
 if has_browser_cookie3 and os.environ.get("DBUS_SESSION_BUS_ADDRESS", "/dev/null") == "/dev/null":

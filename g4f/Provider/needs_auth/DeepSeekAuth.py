@@ -11,7 +11,8 @@ from pathlib import Path
 
 from g4f.typing import AsyncResult, Messages, Cookies
 from g4f.requests import StreamSession, raise_for_status, sse_stream, FormData
-from g4f.cookies import get_cookies, get_headers, get_cookies_dir
+from g4f.cookies import get_cookies, get_cookies_dir
+from curl_cffi.const import CurlHttpVersion
 from g4f.providers.response import (
     JsonConversation, JsonRequest, JsonResponse, 
     Reasoning, FinishReason
@@ -25,20 +26,12 @@ from g4f.image import to_bytes
 # Inline PoW (Proof of Work) implementation for DeepSeek
 # Based on reference implementation in gpt4free/projects/deepseek4free/dsk/pow.py
 
-try:
-    import wasmtime
-    import numpy
-    has_wasmtime_and_numpy = True
-except ImportError:
-    has_wasmtime_and_numpy = False
+import wasmtime
+import numpy as np
+import g4f
+has_wasmtime = True
 
-try:
-    from curl_cffi import CurlHttpVersion
-    has_curl_cffi = True
-except ImportError:
-    has_curl_cffi = False
-
-WASM_PATH = os.path.join(os.path.dirname(__file__), "deepseek", "pow_solver.wasm")
+WASM_PATH = str(Path(g4f.__file__).parent / "tools" / "pow" / "sha3_wasm_bg.7b9ca65ddd.wasm")
 
 class DeepSeekHash:
     """Custom SHA3 hash solver using WebAssembly"""
@@ -49,8 +42,8 @@ class DeepSeekHash:
         self.store = None
         
     def init(self, wasm_path: str):
-        if not has_wasmtime_and_numpy:
-            raise ImportError("wasmtime and numpy are required for PoW solving")
+        if not has_wasmtime:
+            raise ImportError("wasmtime is required for PoW solving")
         
         if not Path(wasm_path).exists():
             raise FileNotFoundError(f"WASM file not found: {wasm_path}")
@@ -109,7 +102,7 @@ class DeepSeekHash:
                 return None
             
             value_bytes = bytes(memory_view[retptr + 8:retptr + 16])
-            value = numpy.frombuffer(value_bytes, dtype=numpy.float64)[0]
+            value = np.frombuffer(value_bytes, dtype=np.float64)[0]
             
             return int(value)
             
@@ -151,6 +144,7 @@ CHAT_SESSION_CREATE_ENDPOINT = f"{DEEPSEEK_URL}/api/v0/chat_session/create"
 CHAT_SESSION_DELETE_ENDPOINT = f"{DEEPSEEK_URL}/api/v0/chat_session/delete"
 CHAT_COMPLETION_ENDPOINT = f"{DEEPSEEK_URL}/api/v0/chat/completion"
 POW_CHALLENGE_ENDPOINT = f"{DEEPSEEK_URL}/api/v0/chat/create_pow_challenge"
+#FILE_UPLOAD_ENDPOINT = f"{DEEPSEEK_URL}/api/v0/files/upload"
 FILE_UPLOAD_ENDPOINT = f"{DEEPSEEK_URL}/v0/file/upload_file"
 
 def generate_client_stream_id() -> str:
@@ -163,7 +157,78 @@ def generate_client_stream_id() -> str:
     hex_part = uuid.uuid4().hex[:16]
     return f"{date_str}-{hex_part}"
 
-class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
+
+def get_har_files():
+    """Get list of DeepSeek HAR files from har_and_cookies directory."""
+    if not os.access(get_cookies_dir(), os.R_OK):
+        return []
+    
+    har_files = []
+    for root, _, files in os.walk(get_cookies_dir()):
+        for file in files:
+            # Look for DeepSeek HAR files
+            if file.endswith(".har") and "deepseek" in file.lower():
+                har_files.append(os.path.join(root, file))
+    
+    # Sort by modification time, newest first
+    har_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return har_files
+
+
+def read_deepseek_har():
+    """
+    Read DeepSeek HAR file to extract cookies and auth token.
+    
+    Returns:
+        dict with 'cookies' and 'authorization' keys or None if not found
+    """
+    import g4f.cookies
+    
+    har_files = get_har_files()
+    
+    if not har_files:
+        debug.log("DeepSeekAuth: No DeepSeek HAR files found in har_and_cookies/")
+        return None
+    
+    # Read HAR files to get cookies and authorization header
+    for har_path in har_files:
+        debug.log(f"DeepSeekAuth: Reading HAR file: {har_path}")
+        
+        # Get cookies using g4f's HAR parser
+        cookies_by_domain = g4f.cookies._parse_har_file(har_path)
+        
+        # Look for DeepSeek cookies
+        deepseek_cookies = None
+        for domain, cookies in cookies_by_domain.items():
+            if 'deepseek.com' in domain:
+                deepseek_cookies = cookies
+                debug.log(f"DeepSeekAuth: Found {len(cookies)} cookies for {domain}")
+                break
+        
+        if not deepseek_cookies:
+            continue
+        
+        # Now look for authorization header in HAR
+        with open(har_path, 'r', encoding='utf-8') as f:
+            har_data = json.load(f)
+        
+        for entry in har_data.get('log', {}).get('entries', []):
+            url = entry.get('request', {}).get('url', '')
+            if 'deepseek.com' in url.lower():
+                for header in entry.get('request', {}).get('headers', []):
+                    if header.get('name', '').lower() == 'authorization':
+                        auth_header = header.get('value')
+                        debug.log(f"DeepSeekAuth: Found authorization token in HAR")
+                        return {
+                            "cookies": deepseek_cookies,
+                            "authorization": auth_header
+                        }
+    
+    debug.log("DeepSeekAuth: No valid DeepSeek auth found in any HAR file")
+    return None
+
+
+class DeepSeekAuth(AsyncGeneratorProvider, ProviderModelMixin):
     """
     DeepSeek provider using browser emulation with HAR file support.
     
@@ -172,10 +237,10 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
     for realistic browser-like requests.
     """
     
-    label = "DeepSeek (HAR Auth)"
+    label = "DeepSeek (Emulated)"
     url = DEEPSEEK_URL
     cookie_domain = DEEPSEEK_DOMAIN
-    working = has_wasmtime_and_numpy
+    working = True
     active_by_default = True
     needs_auth = True
     supports_file_upload = True
@@ -322,7 +387,6 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
         model: str,
         messages: Messages,
         cookies: Cookies = None,
-        headers: dict = None,
         proxy: str = None,
         conversation: JsonConversation = None,
         web_search: bool = False,
@@ -353,17 +417,23 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
             model = cls.default_model
         
         # Try to get auth from HAR file first
+        auth_data = None
         if cookies is None:
-            cookies = get_cookies(cls.cookie_domain, False)
-            headers = get_headers(cls.cookie_domain)
-            if cookies:
-                debug.log(f"DeepSeekAuth: Using {len(cookies)} cookies and {len(headers)} headers from cookie jar")
+            auth_data = read_deepseek_har()
+            if auth_data:
+                cookies = auth_data.get("cookies")
+                debug.log(f"DeepSeekAuth: Using {len(cookies)} cookies from HAR file")
             else:
-                raise MissingAuthError(
-                    "DeepSeekAuth: No authentication found. "
-                    "Please add a DeepSeek HAR file to har_and_cookies/ directory "
-                    "with an authorization token."
-                )
+                # Fall back to cookie jar
+                cookies = get_cookies(cls.cookie_domain, False)
+                if cookies:
+                    debug.log(f"DeepSeekAuth: Using {len(cookies)} cookies from cookie jar")
+                else:
+                    raise MissingAuthError(
+                        "DeepSeekAuth: No authentication found. "
+                        "Please add a DeepSeek HAR file to har_and_cookies/ directory "
+                        "with an authorization token."
+                    )
         
         # Initialize conversation if needed
         if conversation is None:
@@ -373,8 +443,8 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
         
         # Get auth token from HAR data or conversation
         authorization = None
-        if headers:
-            authorization = headers.get("authorization")
+        if auth_data:
+            authorization = auth_data.get("authorization")
         elif hasattr(conversation, 'authorization'):
             authorization = conversation.authorization
         
@@ -477,7 +547,7 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                 cookies=cookies, 
                 proxy=proxy, 
                 impersonate="chrome",
-                http_version=CurlHttpVersion.V1_1 if has_curl_cffi else None  # Force HTTP/1.1 to avoid HTTP/2 stream errors
+                http_version=CurlHttpVersion.V1_1  # Force HTTP/1.1 to avoid HTTP/2 stream errors
             ) as session:
                 upload_result = await cls.upload_file(session, file_bytes, filename)
                 ref_file_ids.append(upload_result["file_id"])
@@ -497,7 +567,7 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
         if hasattr(conversation, 'parent_message_id') and conversation.parent_message_id:
             json_data["parent_message_id"] = conversation.parent_message_id
         
-        # debug.log(f"DeepSeekAuth: Sending request to {CHAT_COMPLETION_ENDPOINT}")
+        debug.log(f"DeepSeekAuth: Sending request to {CHAT_COMPLETION_ENDPOINT}")
         
         async with StreamSession(
             headers=headers, 
@@ -506,22 +576,45 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
             impersonate="chrome"
         ) as session:
             async with session.post(CHAT_COMPLETION_ENDPOINT, json=json_data) as response:
-                # debug.log(f"DeepSeekAuth: Processing response... status={response.status}, content-type={response.headers.get('content-type', 'unknown')}")
+                debug.log(f"DeepSeekAuth: Processing response... status={response.status}, content-type={response.headers.get('content-type', 'unknown')}")
                 await raise_for_status(response)
                 
                 # Check if response is actually SSE or regular JSON
                 content_type = response.headers.get('content-type', '')
                 if 'text/event-stream' not in content_type.lower():
-                    raise RuntimeError(f"Expected SSE response but got content-type: {content_type}")
+                    # Not a streaming response - try regular JSON
+                    debug.log(f"DeepSeekAuth: Response is NOT SSE (content-type: {content_type})")
+                    data = await response.json()
+                    debug.log(f"DeepSeekAuth: Full response: {data}")
+                    
+                    # Check for content in response
+                    if 'content' in data:
+                        content = data.get('content', '')
+                        yield content
+                    if 'choices' in data and len(data['choices']) > 0:
+                        choice = data['choices'][0]
+                        if 'message' in choice and 'content' in choice['message']:
+                            yield choice['message']['content']
+                    if 'finish_reason' in data:
+                        yield FinishReason(data['finish_reason'])
+                    return
                 
-                is_thinking = False
+                # Use existing sse_stream with JsonResponse for streaming
+                full_response = ""
+                is_thinking = 0
+                chunk_num = 0
+                
+                debug.log("DeepSeekAuth: Response is SSE stream")
                 async for stream_data in sse_stream(response):
+                    chunk_num += 1
+                    debug.log(f"DeepSeekAuth: Stream chunk #{chunk_num}: {stream_data}")
+                    
                     # Handle different stream data formats
                     if isinstance(stream_data, dict):
                         # Handle first chunk with message IDs (for conversation continuity)
                         if 'response_message_id' in stream_data:
                             conversation.parent_message_id = stream_data['response_message_id']
-                            # debug.log(f"DeepSeekAuth: Set parent_message_id to {conversation.parent_message_id}")
+                            debug.log(f"DeepSeekAuth: Set parent_message_id to {conversation.parent_message_id}")
                         
                         # Handle initial response with fragments (most common case)
                         # Format: {'v': {'response': {'fragments': [{'content': '42', ...}]}}}
@@ -530,12 +623,11 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                             fragments = response_obj.get('fragments', [])
                             for fragment in fragments:
                                 if isinstance(fragment, dict) and 'content' in fragment:
-                                    if fragment.get('type') == 'THINK':
-                                        is_thinking = True
                                     content = fragment['content']
                                     if isinstance(content, str) and content:
-                                        yield Reasoning(content) if is_thinking else content
-                                        # debug.log(f"DeepSeekAuth: Initial fragment content: '{content}'")
+                                        full_response += content
+                                        yield content
+                                        debug.log(f"DeepSeekAuth: Initial fragment content: '{content}'")
                         
                         # Handle APPEND operations that create new fragments with initial content
                         elif ('p' in stream_data and stream_data['p'] == 'response/fragments' and 
@@ -545,9 +637,9 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                             # Extract content from the new fragment
                             for fragment in stream_data['v']:
                                 if isinstance(fragment, dict) and 'content' in fragment and isinstance(fragment['content'], str):
-                                    is_thinking = False 
+                                    full_response += fragment['content']
                                     yield fragment['content']
-                                    # debug.log(f"DeepSeekAuth: APPEND fragment content: '{fragment['content']}'")
+                                    debug.log(f"DeepSeekAuth: APPEND fragment content: '{fragment['content']}'")
                         
                         # Handle path-based updates (like 'response/fragments/-1/content')
                         elif 'p' in stream_data and 'v' in stream_data:
@@ -556,12 +648,13 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                             
                             # Handle content updates
                             if path.endswith('/content') and isinstance(value, str):
-                                yield Reasoning(value) if is_thinking else value
-                                # debug.log(f"DeepSeekAuth: Content update: '{value}'")
+                                full_response += value
+                                yield value
+                                debug.log(f"DeepSeekAuth: Content update: '{value}'")
                             
                             # Handle status updates
                             elif path == 'response/status' and value == 'FINISHED':
-                                # debug.log("DeepSeekAuth: Stream finished")
+                                debug.log("DeepSeekAuth: Stream finished")
                                 break
                         
                         # Handle batch updates
@@ -569,14 +662,23 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                             for batch_item in stream_data['v']:
                                 if isinstance(batch_item, dict) and 'p' in batch_item and 'v' in batch_item:
                                     if batch_item['p'] == 'response/status' and batch_item['v'] == 'FINISHED':
-                                        # debug.log("DeepSeekAuth: Stream finished (batch)")
+                                        debug.log("DeepSeekAuth: Stream finished (batch)")
                                         break
                         
                         # Handle shorthand content updates
                         elif 'v' in stream_data and isinstance(stream_data['v'], str):
-                            yield Reasoning(stream_data['v']) if is_thinking else stream_data['v']
-                            # debug.log(f"DeepSeekAuth: Shorthand content: '{stream_data['v']}'")
-
+                            full_response += stream_data['v']
+                            yield stream_data['v']
+                            debug.log(f"DeepSeekAuth: Shorthand content: '{stream_data['v']}'")
+                    
+                    # Handle finish reason
+                    elif isinstance(stream_data, FinishReason):
+                        if hasattr(stream_data, 'response_message_id'):
+                            conversation.parent_message_id = stream_data.response_message_id
+                        yield conversation
+                        yield stream_data
+                        break
+                
                 # Ensure we yield the conversation object at the end
                 yield conversation
 
@@ -593,4 +695,5 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
                             conversation.chat_session_id,
                             headers
                         )
-
+                
+                debug.log("DeepSeekAuth: Request completed successfully")
