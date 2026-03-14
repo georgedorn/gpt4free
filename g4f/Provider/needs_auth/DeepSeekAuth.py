@@ -243,7 +243,6 @@ class DeepSeekAuth(AsyncGeneratorProvider, ProviderModelMixin):
     working = True
     active_by_default = True
     needs_auth = True
-    supports_file_upload = True
     
     default_model = "deepseek-v3"
     models = ["deepseek-v3", "deepseek-r1"]
@@ -470,8 +469,23 @@ class DeepSeekAuth(AsyncGeneratorProvider, ProviderModelMixin):
             "authorization": authorization,
         }
         
-        # Extract query from messages
-        prompt = get_last_user_message(messages)
+        # Check if we need to send full conversation history (conversation forking)
+        # Send full history when we have multiple messages and no valid server session
+        should_send_full_history = len(messages) > 1
+        
+        if should_send_full_history:
+            # Reconstruct full conversation from messages for forking
+            conversation_text = []
+            for msg in messages:
+                if msg['role'] == 'user':
+                    conversation_text.append(f"User: {msg['content']}")
+                elif msg['role'] == 'assistant':
+                    conversation_text.append(f"Assistant: {msg['content']}")
+            prompt = "\n".join(conversation_text)
+            debug.log(f"DeepSeekAuth: Forking conversation with {len(messages)} messages")
+        else:
+            # Original behavior: just send the last message
+            prompt = get_last_user_message(messages)
         
         # Determine thinking mode
         thinking_enabled = bool(model) and "deepseek-r1" in model

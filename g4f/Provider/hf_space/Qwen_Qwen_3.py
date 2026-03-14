@@ -78,8 +78,28 @@ class Qwen_Qwen_3(AsyncGeneratorProvider, ProviderModelMixin):
         system_prompt = get_system_prompt(messages)
         system_prompt = system_prompt if system_prompt else "You are a helpful and harmless assistant."
 
+        # Check if we need to send full conversation history (conversation forking)
+        # Send full history when we have multiple messages, since we can't trust
+        # that an existing session_hash is valid on the server side (e.g., after forking)
+        should_send_full_history = len(messages) > 1
+
+        if should_send_full_history:
+            # Reconstruct full conversation from messages for forking
+            conversation_text = []
+            for msg in messages:
+                if msg['role'] == 'user':
+                    conversation_text.append(f"User: {msg['content']}")
+                elif msg['role'] == 'assistant':
+                    conversation_text.append(f"Assistant: {msg['content']}")
+            
+            # Use the full conversation as the user message
+            user_message = "\n".join(conversation_text)
+        else:
+            # Original behavior: just send the last message
+            user_message = get_last_user_message(messages)
+
         payload_join = {"data": [
-            get_last_user_message(messages),
+            user_message,
             {"thinking_budget": thinking_budget, "model": cls.get_model(model), "sys_prompt": system_prompt}, None, None],
             "event_data": None, "fn_index": 13, "trigger_id": 31, "session_hash": conversation.session_hash
         }

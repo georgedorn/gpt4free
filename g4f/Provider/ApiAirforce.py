@@ -9,6 +9,8 @@ class ApiAirforce(OpenaiTemplate):
     url = "https://api.airforce"
     login_url = "https://panel.api.airforce/dashboard"
     base_url = "https://api.airforce/v1"
+    
+    manage_conversation_history = True  # Api.Airforce should support conversation history on client side
     working = True
     active_by_default = True
     use_image_size = True

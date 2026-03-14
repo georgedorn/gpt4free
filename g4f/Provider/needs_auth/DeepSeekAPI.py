@@ -178,7 +178,6 @@ class DeepSeekAPI(AsyncGeneratorProvider, ProviderModelMixin):
     working = has_wasmtime_and_numpy
     active_by_default = True
     needs_auth = True
-    supports_file_upload = True
     
     default_model = "deepseek-v3"
     models = ["deepseek-v3", "deepseek-r1"]

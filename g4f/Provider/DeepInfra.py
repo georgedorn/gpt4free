@@ -10,6 +10,7 @@ class DeepInfra(OpenaiTemplate):
     login_url = "https://deepinfra.com/dash/api_keys"
     base_url = "https://api.deepinfra.com/v1/openai"
     
+    manage_conversation_history = True  # DeepInfra should support conversation history on client side
     working = True
     active_by_default = True
     
