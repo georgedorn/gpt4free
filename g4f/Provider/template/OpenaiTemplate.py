@@ -4,6 +4,7 @@ import requests
 
 from ..helper import filter_none, format_media_prompt
 from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
+from ..mixin.local_conversation_mixin import LocalConversationMixin, LocalConversation
 from ...typing import Union, AsyncResult, Messages, MediaListType
 from ...requests import StreamSession, StreamResponse, raise_for_status, sse_stream
 from ...image import use_aspect_ratio
@@ -15,7 +16,7 @@ from ...config import AppConfig
 from ...errors import MissingAuthError
 from ... import debug
 
-class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin):
+class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin, LocalConversationMixin):
     base_url = ""
     backup_url = None
     api_key = None
@@ -105,6 +106,11 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
             api_key = cls.api_key
         if cls.needs_auth and api_key is None:
             raise MissingAuthError('Add a "api_key"')
+        
+        # Handle local conversation history management for stateless API providers
+        # This prepares effective_messages and updates conversation object
+        effective_messages, conversation = cls.prepare_conversation(messages, conversation)
+        
         async with StreamSession(
             proxy=proxy,
             headers=cls.get_headers(stream, api_key, headers),
@@ -117,7 +123,7 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
 
             # Proxy for image generation feature
             if model and model in cls.image_models:
-                prompt = format_media_prompt(messages, prompt)
+                prompt = format_media_prompt(effective_messages, prompt)
                 size = use_aspect_ratio({"width": kwargs.get("width"), "height": kwargs.get("height")}, kwargs.get("aspect_ratio", None))
                 size = {"size": f"{size['width']}x{size['height']}", **size} if cls.use_image_size and "width" in size and "height" in size else size
                 data = {"prompt": prompt, "model": model, **size}
@@ -137,31 +143,50 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
 
             if stream or stream is None:
                 kwargs.setdefault("stream_options", {"include_usage": True})
-            extra_parameters = {key: kwargs[key] for key in extra_parameters if key in kwargs}
+            extra_parameters_dict = {key: kwargs[key] for key in extra_parameters if key in kwargs}
             if extra_body is None:
                 extra_body = {}
             data = filter_none(
-                messages=list(render_messages(messages, media)),
+                messages=list(render_messages(effective_messages, media)),
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens if max_tokens is not None else cls.max_tokens,
                 top_p=top_p,
                 stop=stop,
-                stream="audio" not in extra_parameters if stream is None else stream,
+                stream="audio" not in extra_parameters_dict if stream is None else stream,
                 user=user if cls.add_user else None,
-                conversation=conversation.get_dict() if conversation else None,
-                **extra_parameters,
+                # Don't send conversation parameter to API when managing conversation history on client side
+                conversation=conversation.get_dict() if conversation and not cls.manage_conversation_history else None,
+                **extra_parameters_dict,
                 **extra_body
             )
+            
+            # Debug: Log the actual data being sent to the API
+            debug.log(f"OpenaiTemplate: Sending API request with data: {data}")
             if api_endpoint is None:
                 if api_endpoint is None:
                     api_endpoint = cls.api_endpoint
                 if api_endpoint is None:
                     api_endpoint = f"{base_url.rstrip('/')}/chat/completions"
             yield JsonRequest.from_dict(data)
+            
+            # Track full response for conversation history management
+            full_response = ""
             async with session.post(api_endpoint, json=data, ssl=cls.ssl) as response:
                 async for chunk in read_response(response, stream, prompt, cls.get_dict(), download_media):
+                    # Accumulate string content for conversation history
+                    if cls.manage_conversation_history and isinstance(chunk, str):
+                        full_response += chunk
                     yield chunk
+            
+            # Finalize conversation history and yield conversation object
+            if cls.manage_conversation_history:
+                if full_response:
+                    cls.finalize_conversation(conversation, full_response)
+                if conversation:
+                    debug.log(f"OpenaiTemplate: Yielding conversation object: {type(conversation)}")
+                    debug.log(f"OpenaiTemplate: Conversation message_history length: {len(conversation.message_history) if hasattr(conversation, 'message_history') else 'N/A'}")
+                    yield conversation
 
     @classmethod
     def get_headers(cls, stream: bool, api_key: str = None, headers: dict = None) -> dict:
@@ -176,50 +201,64 @@ class OpenaiTemplate(AsyncGeneratorProvider, ProviderModelMixin, RaiseErrorMixin
         }
     
 async def read_response(response: StreamResponse, stream: bool, prompt: str, provider_info: dict, download_media: bool) -> AsyncResult:
-    yield HeadersResponse.from_dict({key: value for key, value in response.headers.items() if key.lower().startswith("x-")})
     content_type = response.headers.get("content-type", "text/event-stream" if stream else "application/json")
     if content_type.startswith("application/json"):
-        data = await response.json()
-        if isinstance(data, list):
-            data = next(iter(data), {})
-        if isinstance(data, dict):
-            yield JsonResponse.from_dict(data)
-        OpenaiTemplate.raise_error(data, response.status)
-        await raise_for_status(response)
-        model = data.get("model")
-        if model:
-            yield ProviderInfo(**provider_info, model=model)
-        if "usage" in data:
-            yield Usage.from_dict(data["usage"])
-        if "conversation" in data:
-            yield JsonConversation.from_dict(data["conversation"])
-        if "choices" in data:
-            choice = next(iter(data["choices"]), None)
-            message = choice.get("message", {})
-            if choice and "content" in message and message["content"]:
-                yield message["content"].strip()
-            if "tool_calls" in message:
-                yield ToolCalls(message["tool_calls"])
-            if choice:
-                reasoning_content = choice.get("delta", {}).get("reasoning_content", choice.get("delta", {}).get("reasoning"))
-                if reasoning_content:
-                    yield Reasoning(reasoning_content, status="")
-            audio = message.get("audio", {})
-            if "data" in audio:
-                if download_media:
-                    async for chunk in save_response_media(audio, prompt, [model]):
-                        yield chunk
-                else:
-                    yield AudioResponse(f"data:audio/mpeg;base64,{audio['data']}", transcript=audio.get("transcript"))
-            if choice and "finish_reason" in choice and choice["finish_reason"] is not None:
-                yield FinishReason(choice["finish_reason"])
-                return
+        try:
+            data = await response.json()
+            # Debug: Log parsed JSON response
+            debug.log(f"OpenaiTemplate: Parsed JSON response: {data}")
+
+            if isinstance(data, list):
+                data = next(iter(data), {})
+            if isinstance(data, dict):
+                yield JsonResponse.from_dict(data)
+            OpenaiTemplate.raise_error(data, response.status)
+            await raise_for_status(response)
+            model = data.get("model")
+            if model:
+                yield ProviderInfo(**provider_info, model=model)
+            if "usage" in data:
+                yield Usage.from_dict(data["usage"])
+            if "conversation" in data:
+                yield JsonConversation.from_dict(data["conversation"])
+                debug.log(f"OpenaiTemplate: Conversation data: {data['conversation']}")
+            if "choices" in data:
+                choice = next(iter(data["choices"]), None)
+                message = choice.get("message", {})
+                if choice and "content" in message and message["content"]:
+                    content = message["content"]
+                    # Debug: Log content before yielding
+                    debug.log(f"OpenaiTemplate: Yielding content: {content}")
+                    yield content.strip()
+                if "tool_calls" in message:
+                    yield ToolCalls(message["tool_calls"])
+                if choice:
+                    reasoning_content = choice.get("delta", {}).get("reasoning_content", choice.get("delta", {}).get("reasoning"))
+                    if reasoning_content:
+                        yield Reasoning(reasoning_content, status="")
+                audio = message.get("audio", {})
+                if "data" in audio:
+                    if download_media:
+                        async for chunk in save_response_media(audio, prompt, [model]):
+                            yield chunk
+                    else:
+                        yield AudioResponse(f"data:audio/mpeg;base64,{audio['data']}", transcript=audio.get("transcript"))
+                if choice and "finish_reason" in choice and choice["finish_reason"] is not None:
+                    yield FinishReason(choice["finish_reason"])
+                    return
+        except Exception as e:
+            # Preserve the original exception with full traceback
+            debug.log(f"OpenaiTemplate: JSON parsing failed: {type(e).__name__}: {str(e)}")
+            raise
     elif content_type.startswith("text/event-stream"):
         await raise_for_status(response)
         reasoning = False
         first = True
         model_returned = False
         async for data in sse_stream(response):
+            # Debug: Log each SSE chunk; only enable this when debugging, because it is super spammy
+            # debug.log(f"OpenaiTemplate: Processing SSE chunk: {data}")
+
             yield JsonResponse.from_dict(data)
             OpenaiTemplate.raise_error(data)
             model = data.get("model")
@@ -237,6 +276,8 @@ async def read_response(response: StreamResponse, stream: bool, prompt: str, pro
                         if reasoning:
                             yield Reasoning(status="")
                             reasoning = False
+                        # Debug: Log content before yielding
+                        debug.log(f"OpenaiTemplate: Yielding content: {content}")
                         yield content
                 tool_calls = choice.get("delta", {}).get("tool_calls")
                 if tool_calls:
@@ -249,6 +290,7 @@ async def read_response(response: StreamResponse, stream: bool, prompt: str, pro
                 yield Usage.from_dict(data["usage"])
             if "conversation" in data and data["conversation"]:
                 yield JsonConversation.from_dict(data["conversation"])
+                debug.log(f"OpenaiTemplate: Conversation data: {data['conversation']}")
             if choice and choice.get("finish_reason") is not None:
                 yield FinishReason(choice["finish_reason"])
     else:

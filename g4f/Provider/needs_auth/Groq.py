@@ -4,6 +4,7 @@ from ..template import OpenaiTemplate
 from ...config import DEFAULT_MODEL
 
 class Groq(OpenaiTemplate):
+    manage_conversation_history = True  # Groq should support conversation history on client side
     url = "https://console.groq.com/playground"
     login_url = "https://console.groq.com/keys"
     base_url = "https://api.groq.com/openai/v1"
